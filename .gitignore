@@ -1,0 +1,6 @@
+/data
+/LogFile
+/NewLogFile
+/__pycache__
+*.pth
+conv.py
