@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
 from Arguments import argparser
 from math import sqrt
 PARA = argparser()
