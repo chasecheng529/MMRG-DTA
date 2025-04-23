@@ -13,14 +13,14 @@ os.environ['PYTHONHASHSEED'] = '0'
 
 import time
 from copy import deepcopy
-from Model import TINet
-from AblationModel import AblationTINet
+from Model import MMRGNet
 from sklearn.metrics import roc_auc_score, accuracy_score
 
 from Log import LogModule
 from Metrics import *
 from DataHelper import *
 from Arguments import argparser
+from collections import Counter
 
 PARA = argparser()
 device = torch.device("cuda:" + str(PARA.GPU))
@@ -103,10 +103,9 @@ def InitWeights(model):
             init.xavier_normal_(m.weight.data)
             m.bias.data.fill_(0)
 
-def train(trainDataLoader, model, PARA):
+def train(trainDataLoader, model, PARA, optimizer, lamda):
     model.train()
     lossFunc = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr = 0.001)
     with tqdm(trainDataLoader) as t:
         MSELossList = []
         drugLossList = []
@@ -124,7 +123,7 @@ def train(trainDataLoader, model, PARA):
             drugLoss = GenLoss(new_drug, drug, mu_drug, logvar_drug)
             proteinLoss = GenLoss(new_target, target, mu_target, logvar_target)
 
-            loss = affinityLoss + 10 ** PARA.lamda * (drugLoss + PARA.maxDrugLen / PARA.maxProteinLen * proteinLoss)
+            loss = affinityLoss + 10 ** lamda * (drugLoss + PARA.maxDrugLen / PARA.maxProteinLen * proteinLoss)
             loss.backward()
             optimizer.step()
 
@@ -134,7 +133,7 @@ def train(trainDataLoader, model, PARA):
             trainLossList.append(loss.item())
 
             t.set_postfix(TrainLoss=np.mean(trainLossList), MSE=np.mean(MSELossList))
-        #logger.LogInfoWithArgs("Train:",MSE = np.mean(MSELossList), drugLoss=np.mean(drugLossList), targetLoss= np.mean(targetLossList), totalLoss=np.mean(trainLossList))
+        logger.LogInfoWithArgs("Train:",MSE = np.mean(MSELossList), drugLoss=np.mean(drugLossList), targetLoss= np.mean(targetLossList), totalLoss=np.mean(trainLossList))
     return model
 
 def test(testDataLoader, model, PARA):
@@ -143,23 +142,16 @@ def test(testDataLoader, model, PARA):
     MAELossFunc = nn.L1Loss()
     affinities = []
     pre_affinities = []
-    drugLoss = 0
-    proteinLoss = 0
     with torch.no_grad():
         for i,(drugSMILES, drugAdj, drugDegree, proteinSeq, affinity) in enumerate(testDataLoader):
             drugSMILES = drugSMILES.cuda(device)
             proteinSeq = proteinSeq.cuda(device)
             drugDegree = drugDegree.cuda(device)
 
-            if PARA.modelName == "TIVAE":
-                pre_affinity, new_drug, new_target, drug, target, mu_drug, logvar_drug, mu_target, logvar_target = model(drugSMILES, drugAdj, drugDegree, proteinSeq, PARA)
-            else:
-                pre_affinity, new_drug, new_target, drug, target, mu_drug, logvar_drug, mu_target, logvar_target = model(drugSMILES, proteinSeq, PARA)
+            pre_affinity, new_drug, new_target, drug, target, mu_drug, logvar_drug, mu_target, logvar_target = model(drugSMILES, drugAdj, drugDegree, proteinSeq, PARA)
             
             pre_affinities += pre_affinity.cpu().detach().numpy().tolist()
             affinities += affinity.cpu().detach().numpy().tolist()
-            drugLoss += GenLoss(new_drug, drug, mu_drug, logvar_drug)
-            proteinLoss += GenLoss(new_target, target, mu_target, logvar_target)
 
         pre_affinities = np.array(pre_affinities)
         affinities = np.array(affinities)
@@ -169,46 +161,86 @@ def test(testDataLoader, model, PARA):
         rm2 = GetRM2(affinities, pre_affinities)
     return cIndex, MSELoss, MAELoss, rm2
 
-def testForPlot(testDataLoader, model, PARA):
-    model.eval()
-    
 
-    affinities = []
-    pre_affinities = []
+def ParameterSearch(PARA, valDataLoader, trainDataLoader):
+    proteinFilterLen = PARA.proteinFilterLen
+    drugFilterLen = PARA.drugFilterLen
+    lamda = PARA.lamda
 
-    with torch.no_grad():
-        for i,(drugSMILES, drugAdj, drugDegree, proteinSeq, affinity) in enumerate(testDataLoader):
-            drugSMILES = drugSMILES.cuda(device)
-            proteinSeq = proteinSeq.cuda(device)
-            drugDegree = drugDegree.cuda(device)
-
-            if PARA.modelName == "TIVAE":
-                pre_affinity, new_drug, new_target, drug, target, mu_drug, logvar_drug, mu_target, logvar_target = model(drugSMILES, drugAdj, drugDegree, proteinSeq, PARA)
-            else:
-                pre_affinity, new_drug, new_target, drug, target, mu_drug, logvar_drug, mu_target, logvar_target = model(drugSMILES, proteinSeq, PARA)
-            
-            pre_affinities += pre_affinity.cpu().detach().numpy().tolist()
-            affinities += affinity.cpu().detach().numpy().tolist()
-
-
-        pre_affinities = np.array(pre_affinities)
-        affinities = np.array(affinities)
-        #Draw Image
+    eachSearchRefCindex = []
+    for eachProteinFilterLen in proteinFilterLen:
+        for eachDrugFilterLen in drugFilterLen:
+            for eachLamda in lamda:
+                logger.LogInfoWithStr("INFO","============================SEARCH=========================")
+                model = MMRGNet(PARA, eachProteinFilterLen, eachDrugFilterLen).cuda(device)
+                model.apply(InitWeights)
+                optimizer = optim.Adam(model.parameters(), lr = 0.001)
+                searchRefCindex = 0
+                for epochind in range(PARA.numEpoch):
+                    model = train(trainDataLoader, model, PARA, optimizer, eachLamda)
+                    cIndex, _, _, _ = test(valDataLoader, model, PARA)
+                    searchRefCindex = max(searchRefCindex, cIndex)
+                eachSearchRefCindex.append(searchRefCindex)
+                logger.LogInfoWithStr("INFO","CI :{} --> PARA: ProteinFilterLen: {}, DrugFilterLen: {}, Lamda: {}".format(searchRefCindex, eachProteinFilterLen, eachDrugFilterLen, eachLamda))
+    return eachSearchRefCindex
 
 # This function is used to run 6Fold Validation, each splited folds will be used 6 times!
 def RunNFoldExperiment(XD, XAdj, XDegree, XT, Y, label_row_inds, label_col_inds, PARA, labeled_sets, val_sets, test_sets):
+    foldParaSearchResult = []
+    bestProteinFilterLen, bestDrugFilterLen, bestLamda = 0, 0, 0
+     # If only one choice in parameter list, do not run parameter search
+    if len(PARA.proteinFilterLen) == 1 and len(PARA.drugFilterLen) == 1 and len(PARA.lamda) == 1:
+        logger.LogInfoWithStr('INFO', 'No need to run parameter search')
+        bestProteinFilterLen, bestDrugFilterLen, bestLamda = PARA.proteinFilterLen[0], PARA.drugFilterLen[0], PARA.lamda[0]
+    else:
+        for foldind in range(len(val_sets)):
+            logger.LogInfoWithStr("FOLD:{}".format(foldind),"============================PARAMETER SEARCH=========================")
+            valinds = val_sets[foldind]
+            labeledinds = labeled_sets[foldind]
+            testinds = test_sets[foldind]
+
+            terows = label_row_inds[testinds]
+            tecols = label_col_inds[testinds]
+            test_dataset = prepare_interaction_pairs(XD, XAdj, XDegree, XT, Y, terows, tecols)
+
+            trrows = label_row_inds[labeledinds]
+            trcols = label_col_inds[labeledinds]
+            train_dataset = prepare_interaction_pairs(XD, XAdj, XDegree, XT, Y, trrows, trcols)
+
+            valrows = label_row_inds[valinds]
+            valcols = label_col_inds[valinds]
+            val_dataset = prepare_interaction_pairs(XD, XAdj, XDegree, XT, Y, valrows, valcols)
+
+
+            train_loader = DataLoader(dataset = train_dataset, batch_size = PARA.batchSize, shuffle = True)
+            test_loader = DataLoader(dataset = test_dataset, batch_size = PARA.batchSize)
+            val_loader = DataLoader(dataset = val_dataset, batch_size = PARA.batchSize)
+
+            foldParaSearchResult.append(ParameterSearch(PARA, val_loader, train_loader))
+        
+        # Get Parameter search result
+        foldParaSearchResultArray = np.array(foldParaSearchResult)
+        foldParaSearchSum = list(foldParaSearchResultArray.sum(axis = 0))
+        bestPointer = foldParaSearchSum.index(max(foldParaSearchSum))
+        pointer = 0
+        for eachProteinFilterLen in PARA.proteinFilterLen:
+            for eachDrugFilterLen in PARA.drugFilterLen:
+                for eachLamda in PARA.lamda:
+                    if bestPointer == pointer:
+                        bestProteinFilterLen, bestDrugFilterLen, bestLamda = eachProteinFilterLen, eachDrugFilterLen, eachLamda
+                        pointer += 1
+                    else:
+                        pointer += 1
+                        continue
+    logger.LogInfoWithStr("INFO","BEST PARA: ProteinFilterLen: {}, DrugFilterLen: {}, Lamda: {}".format(bestProteinFilterLen, bestDrugFilterLen, bestLamda))
+
+    logger.LogInfoWithStr("INFO","============================TRAINING=========================")
     crossValMSE = []
     crossValMAE = []
     crossValCI = []
     crossValRM2 = []
-
-    AbcrossValMSE = []
-    AbcrossValMAE = []
-    AbcrossValCI = []
-    AbcrossValRM2 = []
-
     for foldind in range(len(val_sets)):
-        logger.LogInfoWithStr("FOLD:{}".format(foldind),"============================NEW FOLD=========================")
+        logger.LogInfoWithStr("FOLD:{}".format(foldind),"==========================================================")
         valinds = val_sets[foldind]
         labeledinds = labeled_sets[foldind]
         testinds = test_sets[foldind]
@@ -228,88 +260,34 @@ def RunNFoldExperiment(XD, XAdj, XDegree, XT, Y, label_row_inds, label_col_inds,
 
         train_loader = DataLoader(dataset = train_dataset, batch_size = PARA.batchSize, shuffle = True)
         test_loader = DataLoader(dataset = test_dataset, batch_size = PARA.batchSize)
-        val_loader = DataLoader(dataset = val_dataset, batch_size = PARA.batchSize) # Used for parameter search!
+        val_loader = DataLoader(dataset = val_dataset, batch_size = PARA.batchSize)
 
-        model = TINet(PARA).cuda(device)
+        model = MMRGNet(PARA, bestProteinFilterLen, bestDrugFilterLen).cuda(device)
         model.apply(InitWeights)
+        optimizer = optim.Adam(model.parameters(), lr = 0.001)
 
-        Abmodel = AblationTINet(PARA).cuda(device)
-        Abmodel.apply(InitWeights)
-
-        
-        CIndexList = []
-        MSEList = []
-        MAEList = []
-        RM2List = []
-
-        AbCIndexList = []
-        AbMSEList = []
-        AbMAEList = []
-        AbRM2List = []
-
+        refMSE = np.inf
         for epochind in range(PARA.numEpoch):
-            model = train(train_loader, model, PARA)
-            Abmodel = train(train_loader, Abmodel, PARA)
+            model = train(train_loader, model, PARA, optimizer, bestLamda)
+            valCindex, valMSE, valMAE, valR2 = test(test_loader, model, PARA)
+            logger.LogInfoWithStr('VAL', 'Epoch:{}, MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(epochind, valMSE, valMAE, valCindex, valR2))
+            if refMSE >= valMSE:
+                refMSE = valMSE
+                torch.save(model, 'checkpoint-{}.pth'.format(PARA.gitNode))
 
-
-            cIndex, MSELoss, MAELoss, rm2 = test(test_loader, model, PARA) 
-            AbcIndex, AbMSELoss, AbMAELoss, Abrm2 = test(test_loader, Abmodel, PARA) 
-
-            CIndexList.append(cIndex)
-            MSEList.append(MSELoss)
-            MAEList.append(MAELoss)
-            RM2List.append(rm2)
-
-            AbCIndexList.append(AbcIndex)
-            AbMSEList.append(AbMSELoss)
-            AbMAEList.append(AbMAELoss)
-            AbRM2List.append(Abrm2)
-
-            logger.LogInfoWithStr('TEST', 'Epoch:{}, MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(epochind, MSELoss, MAELoss, cIndex, rm2))
-            logger.LogInfoWithStr('AB TEST', 'Epoch:{}, MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(epochind, AbMSELoss, AbMAELoss, AbcIndex, Abrm2))
-            '''
-            if MSELoss <= min(MSEList):
-                torch.save(model, '{}.pth'.format(PARA.gitNode[-5:]))
-            '''
-        logger.LogInfoWithStr('FOLD Result', 'MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(min(MSEList), min(MAEList), min(CIndexList), min(RM2List)))
-        logger.LogInfoWithStr('AB FOLD Result', 'MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(min(AbMSEList), min(AbMAEList), min(AbCIndexList), min(AbRM2List)))
-
+        model = torch.load('checkpoint-{}.pth'.format(PARA.gitNode))
+        cIndex, mse, mae, rm2 = test(test_loader, model, PARA)
+        logger.LogInfoWithStr('FOLD Result', 'MSE:{:.3f}, MAE:{:.3f}, Cindex:{:.3f}, RM2:{:.3f}'.format(mse, mae, cIndex, rm2))
         #Record the cross validation result. We should only get the result from same validation round!
-        crossValMSE.append(min(MSEList))
-        crossValCI.append(min(CIndexList))
-        crossValMAE.append(min(MAEList))
-        crossValRM2.append(min(RM2List))
-
-        AbcrossValMSE.append(min(AbMSEList))
-        AbcrossValCI.append(min(AbCIndexList))
-        AbcrossValMAE.append(min(AbMAEList))
-        AbcrossValRM2.append(min(AbRM2List))
-        '''
-        # When training finished, record the best result
-        loss_func = nn.MSELoss()
-        mae_loss_func = nn.L1Loss()
-        affinities = []
-        pre_affinities = []
-        model=torch.load('{}.pth'.format(PARA.gitNode[-5:]))
-        model.eval()
-        for drugSMILES, drugAdj, drugDegree, proteinSeq, affinity in test_loader:
-            pre_affinity, _, _, _, _, _, _, _, _ = model(drugSMILES, drugAdj, drugDegree, proteinSeq, PARA)
-            pre_affinities += pre_affinity.cpu().detach().numpy().tolist()
-            affinities += affinity.cpu().detach().numpy().tolist()
-
-        pre_affinities = np.array(pre_affinities)
-        affinities = np.array(affinities)
-        MSELoss = loss_func(torch.Tensor(pre_affinities), torch.Tensor(affinities))
-        MAELoss = mae_loss_func(torch.Tensor(pre_affinities), torch.Tensor(affinities))
-        cIndex = GetCIndex(affinities,pre_affinities)
-        rm2 = GetRM2(affinities, pre_affinities)
-        '''
-
+        crossValMSE.append(mse)
+        crossValCI.append(cIndex)
+        crossValMAE.append(mae)
+        crossValRM2.append(rm2)
     # When cross validation finished, we record the result
-    logger.LogInfoWithStr("FOLD FINAL RESULT:", "MSE = {:.3f}({:.3f}), MAE = {:.3f}({:.3f}), CI = {:.3f}({:.3f}), R2 = {:.3f}({:.3f})".format(np.mean(crossValMSE), np.std(crossValMSE), np.mean(crossValMAE), np.std(crossValMAE), np.mean(crossValCI), np.std(crossValCI), np.mean(crossValRM2), np.std(crossValRM2)))
-    logger.LogInfoWithStr("AB FOLD FINAL RESULT:", "MSE = {:.3f}({:.3f}), MAE = {:.3f}({:.3f}), CI = {:.3f}({:.3f}), R2 = {:.3f}({:.3f})".format(np.mean(AbcrossValMSE), np.std(AbcrossValMSE), np.mean(AbcrossValMAE), np.std(AbcrossValMAE), np.mean(AbcrossValCI), np.std(AbcrossValCI), np.mean(AbcrossValRM2), np.std(AbcrossValRM2)))
-
+    logger.LogInfoWithStr("SPLIT RESULT:", "MSE = {:.3f}({:.3f}), MAE = {:.3f}({:.3f}), CI = {:.3f}({:.3f}), R2 = {:.3f}({:.3f})".format(np.mean(crossValMSE), np.std(crossValMSE), np.mean(crossValMAE), np.std(crossValMAE), np.mean(crossValCI), np.std(crossValCI), np.mean(crossValRM2), np.std(crossValRM2)))
     return crossValMSE, crossValMAE, crossValCI, crossValRM2
+
+       
 
 
 def GenNFlodData(XD, XAdj, XDegree, XT, Y, label_row_inds, label_col_inds, PARA, dataset, nfolds):
@@ -381,10 +359,11 @@ def RunExperiment(PARA, foldcount=6):  # 6-fold cross validation
     CI = []
     R2 = []
 
+
     for i in range(10):
         logger.LogInfoWithStr("Split {}".format(i),"==============================================================================================================================================")
         #Set rand num seed for 10 times random split
-        random.seed(i + 1000)
+        random.seed(i + 1234)
 
         # Construct dataset
         if PARA.problemType == 1:
@@ -395,14 +374,14 @@ def RunExperiment(PARA, foldcount=6):  # 6-fold cross validation
             nfolds = get_targetwise_folds(label_row_inds, label_col_inds, targetcount, foldcount)
 
         # Run N Flod Cross Validation Experiment
-        minMSE, minMAE, maxCI, maxRM2 = GenNFlodData(XD, XAdj, XDegree, XT, Y, label_row_inds,label_col_inds, PARA, dataset, nfolds)
-        MSE.extend(minMSE)
-        MAE.extend(minMAE)
-        CI.extend(maxCI)
-        R2.extend(maxRM2)
+        minMSEs, minMAEs, maxCIs, maxRM2s = GenNFlodData(XD, XAdj, XDegree, XT, Y, label_row_inds,label_col_inds, PARA, dataset, nfolds)
+        MSE.extend(minMSEs)
+        MAE.extend(minMAEs)
+        CI.extend(maxCIs)
+        R2.extend(maxRM2s)
+
     logger.LogInfoWithStr("FINAL RESULT:", "==============================================================================================================================================")
     logger.LogInfoWithStr("FINAL RESULT:", "MSE = {:.3f}({:.3f}), MAE = {:.3f}({:.3f}), CI = {:.3f}({:.3f}), R2 = {:.3f}({:.3f})".format(np.mean(MSE), np.std(MSE), np.mean(MAE), np.std(MAE), np.mean(CI), np.std(CI), np.mean(R2), np.std(R2)))
-    logger.LogInfoWithArgs("Key Settings:", Model = PARA.modelName, Problem = PARA.problemType, PFL = PARA.proteinFilterLen, DFL = PARA.drugFilterLen, Lambda = PARA.lamda, PL = PARA.maxProteinLen, DL = PARA.maxDrugLen, NumHidden = PARA.numHidden)
 
 if __name__ == "__main__":
     PARA = argparser()

@@ -9,14 +9,15 @@ git commit -m "提交代码文件 - $current_time"
 
 # 获取最新的Git提交节点号
 git_hash=$(git rev-parse HEAD)
+git_hash="${git_hash:0:6}"
 
 # 启动main.py并传递节点号作为参数
 nohup python main.py --gitNode "$git_hash" >/dev/null 2>&1 &
 
-PID = $!
+PID=$!
 # 获取并输出进程号
 echo "Python进程已启动，PID为: $PID"
 
-echo "Process ID: $PID" > processRecord.txt
+echo "Process ID: $PID" >> processRecord.txt
 echo "Start Time: $current_time" >> processRecord.txt
 

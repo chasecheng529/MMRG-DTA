@@ -7,13 +7,13 @@ def argparser():
   parser.add_argument(
       '--proteinFilterLen',
       type=int,
-      default=11,
+      default=[11],
       help='The filter lenth of convolution for decoder protein'
   )
   parser.add_argument(
       '--drugFilterLen',
       type=int,
-      default=7,
+      default=[5],
       help='The filter lenth of convolution for decoder drug'
   )
   parser.add_argument(
@@ -39,7 +39,7 @@ def argparser():
   parser.add_argument(
       '--numEpoch',
       type=int,
-      default=1,
+      default=200,
       help='Number of epochs to train.'
   )
   parser.add_argument(
@@ -57,8 +57,8 @@ def argparser():
   parser.add_argument(
       '--problemType',
       type=int,
-      default=2,
-      help='Type of the prediction problem (1-3)'
+      default=3,
+      help='Type of the prediction problem (1-3), 2-new drug setting, 3-new target setting'
   )
 
   parser.add_argument(
@@ -76,24 +76,18 @@ def argparser():
   parser.add_argument(
       '--logDir',
       type=str,
-      default='NewLogFile/',
+      default='LogFile/',
       help='Directory for log data.'
   )
   parser.add_argument(
       '--lamda',
       type=int,
-      default=-5,
+      default=[-5],
   )
   parser.add_argument(
         '--GPU',
         type=int,
-        default=2,
-  )
-  parser.add_argument(
-        '--modelName',
-        type=str,
-        default="TIVAE",
-        help = "CoVAE, TIVAE, MTDTA"
+        default=0,
   )
   parser.add_argument(
         '--gitNode',
@@ -103,7 +97,7 @@ def argparser():
   parser.add_argument(
         '--MoreInfo',
         type=str,
-        default="TIVAE-3CNN->1GCN-I",
+        default="",
   )
   FLAGS, unparsed = parser.parse_known_args()
   return FLAGS

@@ -4,3 +4,5 @@
 /__pycache__
 *.pth
 conv.py
+*.xlsx
+processRecord.txt
